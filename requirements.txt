@@ -1,0 +1,10 @@
+flask
+gunicorn
+aiohttp
+aiofiles
+psutil
+pymongo
+motor
+dnspython
+certifi
+telethon
